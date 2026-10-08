@@ -1,0 +1,113 @@
+
+"""
+anime2real.py - Anime / Manhwa to Photorealistic
+GitHub Ready | Single File
+Cara kerja: Upload gambar anime -> auto caption -> img2img pake model RealVisXL biar jadi foto nyata
+
+Author: buat kamu
+Repo: tinggal push file ini aja ke GitHub
+"""
+
+import torch
+from PIL import Image
+import gradio as gr
+
+# --- Load Models (lazy load biar hemat) ---
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from diffusers import AutoPipelineForImage2Image
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+
+print(f"Device: {DEVICE}")
+
+# 1. BLIP buat baca gambar anime jadi deskripsi teks
+blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+blip_model = BlipForConditionalGeneration.from_pretrained(
+    "Salesforce/blip-image-captioning-large", torch_dtype=DTYPE
+).to(DEVICE)
+
+# 2. Model Realistis - ini yang bikin hasilnya kayak foto beneran, bukan AI
+# RealVisXL V4.0 itu model paling natural buat kulit & wajah
+pipe = AutoPipelineForImage2Image.from_pretrained(
+    "SG161222/RealVisXL_V4.0",
+    torch_dtype=DTYPE,
+    variant="fp16" if DEVICE == "cuda" else None,
+    use_safetensors=True
+).to(DEVICE)
+
+# Optimasi
+if DEVICE == "cuda":
+    pipe.enable_model_cpu_offload()
+    # pipe.enable_xformers_memory_efficient_attention() # uncomment kalo udah install xformers
+
+# --- Prompt biar hasilnya NYATA & ANTI-AI LOOK ---
+REALISTIC_PROMPT_SUFFIX = "photorealistic, real human, ultra realistic, natural skin texture, detailed skin pores, natural lighting, DSLR photo, 85mm lens, sharp focus, 8k, real person, korean/japanese idol look"
+NEGATIVE_PROMPT = "anime, cartoon, drawing, painting, 3d, cgi, illustration, AI generated, fake skin, plastic skin, blurry, deformed, extra fingers, bad anatomy, watermark, text"
+
+def get_caption(image: Image.Image):
+    inputs = blip_processor(image, return_tensors="pt").to(DEVICE, DTYPE)
+    out = blip_model.generate(**inputs, max_new_tokens=50)
+    caption = blip_processor.decode(out[0], skip_special_tokens=True)
+    # bersihin kata anime
+    caption = caption.replace("cartoon", "").replace("anime", "").replace("drawing", "")
+    return caption.strip()
+
+def anime_to_real(input_image, extra_prompt="", strength=0.65, guidance=8.5):
+    if input_image is None:
+        return None, "Upload dulu gambar anime/manhwa nya"
+    
+    if isinstance(input_image, dict): # gr compatibility
+        input_image = input_image['composite']
+    
+    image = Image.fromarray(input_image).convert("RGB") if not isinstance(input_image, Image.Image) else input_image.convert("RGB")
+    image = image.resize((1024, 1024)) # RealVisXL optimal di 1024
+
+    # Auto caption
+    base_caption = get_caption(image)
+    final_prompt = f"{base_caption}, {extra_prompt}, {REALISTIC_PROMPT_SUFFIX}" if extra_prompt else f"{base_caption}, {REALISTIC_PROMPT_SUFFIX}"
+    
+    print(f"Prompt: {final_prompt}")
+
+    # img2img - strength itu kunci
+    # 0.4-0.55 = mirip banget sama anime aslinya tapi jadi real
+    # 0.6-0.75 = lebih bebas jadi foto real (rekomendasi)
+    # 0.8+ = jadi orang beda
+    result = pipe(
+        prompt=final_prompt,
+        negative_prompt=NEGATIVE_PROMPT,
+        image=image,
+        strength=strength,
+        guidance_scale=guidance,
+        num_inference_steps=30,
+    ).images[0]
+
+    return result, f"Caption terdeteksi: {base_caption}"
+
+# --- Gradio UI (biar bisa demo di HuggingFace / lokal) ---
+with gr.Blocks(title="Anime to Real - Manhwa to Real Photo") as demo:
+    gr.Markdown("# Anime / Manhwa → Foto Nyata (Anti AI Look) 
+Upload gambar anime/manhwa, hasilnya bakal jadi kayak foto studio beneran.")
+    
+    with gr.Row():
+        with gr.Column():
+            inp = gr.Image(type="numpy", label="Upload Gambar Anime/Manhwa")
+            extra = gr.Textbox(label="Deskripsi tambahan (opsional)", placeholder="cth: handsome korean man 20 years old, black hair, wearing white shirt, looking at camera")
+            with gr.Row():
+                strength = gr.Slider(0.3, 0.9, value=0.62, step=0.01, label="Realness Strength (0.6 paling natural)")
+                guidance = gr.Slider(1, 15, value=8.5, label="Guidance")
+            btn = gr.Button("JADIKAN NYATA 🔥", variant="primary")
+        with gr.Column():
+            out = gr.Image(type="pil", label="Hasil Foto Real")
+            caption_out = gr.Textbox(label="Info")
+
+    btn.click(anime_to_real, inputs=[inp, extra, strength, guidance], outputs=[out, caption_out])
+
+    gr.Markdown("### Tips biar hasilnya gak keliatan AI:
+- Strength 0.55-0.65 itu sweet spot
+- Tambahin deskripsi umur & pakaian di kolom tambahan
+- Kalo muka ancur, turunin strength
+- Model ini udah anti plastik skin, jadi kulit bakal ada pori-pori natural")
+
+if __name__ == "__main__":
+    demo.launch()
